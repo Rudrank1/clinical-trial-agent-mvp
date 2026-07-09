@@ -27,7 +27,6 @@ function IssueDetail() {
   const [successMessage, setSuccessMessage] = useState(null)
   const [pendingAction, setPendingAction] = useState(null)
 
-  const [selectedKitIds, setSelectedKitIds] = useState(new Set())
   const [editingShipment, setEditingShipment] = useState(false)
   const [shipmentForm, setShipmentForm] = useState({})
 
@@ -38,9 +37,6 @@ function IssueDetail() {
       setIssue(data)
       setError(null)
       if (data.mismatch) {
-        setSelectedKitIds(
-          new Set(data.mismatch.kits.filter((kit) => kit.pending).map((kit) => kit.kit_id)),
-        )
         setShipmentForm({
           logistics_status: data.mismatch.shipment.logistics_status ?? '',
           delivered_at: toDatetimeLocal(data.mismatch.shipment.delivered_at),
@@ -73,15 +69,6 @@ function IssueDetail() {
     } finally {
       setPendingAction(null)
     }
-  }
-
-  const toggleKit = (kitId) => {
-    setSelectedKitIds((prev) => {
-      const next = new Set(prev)
-      if (next.has(kitId)) next.delete(kitId)
-      else next.add(kitId)
-      return next
-    })
   }
 
   const saveShipment = (event) => {
@@ -214,7 +201,6 @@ function IssueDetail() {
             <table className="table table-sm mb-0">
               <thead>
                 <tr>
-                  <th></th>
                   <th>Kit</th>
                   <th>Status</th>
                   <th>Dispensed</th>
@@ -225,14 +211,6 @@ function IssueDetail() {
               <tbody>
                 {issue.mismatch.kits.map((kit) => (
                   <tr key={kit.kit_id} className={kit.pending ? 'table-warning' : ''}>
-                    <td>
-                      <input
-                        type="checkbox"
-                        disabled={resolved}
-                        checked={selectedKitIds.has(kit.kit_id)}
-                        onChange={() => toggleKit(kit.kit_id)}
-                      />
-                    </td>
                     <td>{kit.kit_id}</td>
                     <td>{kit.kit_status}</td>
                     <td>{formatDate(kit.dispensed_at)}</td>
@@ -247,20 +225,16 @@ function IssueDetail() {
             <button
               type="button"
               className="btn btn-success btn-sm"
-              disabled={resolved || pendingAction !== null || selectedKitIds.size === 0}
-              onClick={() => {
-                const kitIds = Array.from(selectedKitIds)
+              disabled={resolved || pendingAction !== null}
+              onClick={() =>
                 runAction(
                   'mark-received',
-                  () => markIssueReceived(issueId, kitIds),
-                  (result) =>
-                    `${kitIds.length} kit(s) marked received — issue is now ${humanStatus(result.status)}.`,
+                  () => markIssueReceived(issueId),
+                  (result) => `Shipment marked as received — issue is now ${humanStatus(result.status)}.`,
                 )
-              }}
+              }
             >
-              {pendingAction === 'mark-received'
-                ? 'Marking…'
-                : `Mark ${selectedKitIds.size || ''} selected kit(s) as received`}
+              {pendingAction === 'mark-received' ? 'Marking…' : 'Mark Shipment as Received'}
             </button>
           </div>
         </div>

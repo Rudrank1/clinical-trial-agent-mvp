@@ -24,8 +24,7 @@ UPCOMING_VISIT_WINDOW_DAYS = 14
 FOLLOW_UP_INTERVAL_SECONDS = int(os.getenv("FOLLOW_UP_INTERVAL_SECONDS", "1200"))
 MAX_FOLLOW_UP_VISITS = 2
 RECEIPT_INSTRUCTIONS = (
-    "Locate the shipment, confirm the kit count, and mark the receipt as complete "
-    "in whatever system you track it in."
+    "Locate the shipment and mark the receipt as complete in whatever system you track it in."
 )
 ESCALATION_REASONS = {
     "Follow-up Node": "We followed up more than once, but the shipment still hasn't been marked as received.",
@@ -33,7 +32,13 @@ ESCALATION_REASONS = {
 }
 
 
-def find_delivery_candidates(db) -> list[dict[str, Any]]:
+def find_delivery_candidates(
+    db,
+    *,
+    study_id: str | None = None,
+    country_id: str | None = None,
+    site_id: str | None = None,
+) -> list[dict[str, Any]]:
     stmt = (
         select(Shipment, Site, Country, Study)
         .join(
@@ -60,6 +65,12 @@ def find_delivery_candidates(db) -> list[dict[str, Any]]:
         .where(Kit.dispensed_at.is_(None))
         .distinct()
     )
+    if study_id:
+        stmt = stmt.where(Shipment.study_id == study_id)
+    if country_id:
+        stmt = stmt.where(Site.country_id == country_id)
+    if site_id:
+        stmt = stmt.where(Shipment.site_id == site_id)
     return [
         _build_candidate(db, shipment, site, country, study)
         for shipment, site, country, study in db.execute(stmt).all()
@@ -148,7 +159,7 @@ def _build_candidate(db, shipment, site, country, study) -> dict[str, Any]:
             if shipment.delivered_at
             else None
         ),
-        "sap_status": shipment.logistics_status,
+        "carrier_status": shipment.logistics_status,
         "carrier_name": shipment.carrier_name,
         "tracking_number": shipment.tracking_number,
         # Proof of delivery is not yet represented in the source schema.
@@ -170,9 +181,9 @@ def _build_candidate(db, shipment, site, country, study) -> dict[str, Any]:
 def is_check_in_due(db, issue: Issue) -> bool:
     """Whether it's time to recheck this issue's underlying database state.
 
-    An issue that is Waiting for Response gets rechecked on a timer (the
-    latest reminder's due_at) rather than waiting on a site reply, since the
-    workflow now detects fixes by polling the source data directly.
+    An open issue gets rechecked on a timer (the latest reminder's due_at)
+    rather than waiting on a site reply, since the workflow now detects
+    fixes by polling the source data directly.
     """
     reminder = (
         db.query(IssueAction)
@@ -187,28 +198,22 @@ def is_check_in_due(db, issue: Issue) -> bool:
     return datetime.utcnow() >= reminder.due_at
 
 
-def mark_kits_received(db, issue: Issue, kit_ids: list[str] | None = None) -> int:
-    """Mark this issue's pending kits as received, closing the gap the person found.
+def mark_kits_received(db, issue: Issue) -> int:
+    """Mark the shipment's receipt as complete, closing the gap the person found.
 
     Lets the UI resolve a Delivery Not Registered issue directly instead of
-    requiring a real inventory system or manual SQL. If `kit_ids` is given,
-    only those kits (intersected with what's actually still pending, for
-    safety) are marked; otherwise every currently-pending kit is marked, same
-    as before this parameter existed.
+    requiring a real inventory system or manual SQL. A shipment's receipt is
+    either registered or it isn't — there's no partial state — so this always
+    marks every currently-pending kit on the shipment, all at once.
     """
     candidate = _refresh_candidate(db, _context_for_issue(db, issue))
     pending_kit_ids = candidate.get("pending_kit_ids") or []
-    target_kit_ids = (
-        pending_kit_ids
-        if kit_ids is None
-        else [kit_id for kit_id in kit_ids if kit_id in pending_kit_ids]
-    )
-    if not target_kit_ids:
+    if not pending_kit_ids:
         return 0
     updated = (
         db.query(Kit)
         .filter(Kit.study_id == candidate.get("study_id"))
-        .filter(Kit.kit_id.in_(target_kit_ids))
+        .filter(Kit.kit_id.in_(pending_kit_ids))
         .update({"kit_status": "RECEIVED"}, synchronize_session=False)
     )
     db.commit()
@@ -310,9 +315,8 @@ def delivery_initial_node(state: AgentWorkflowState) -> dict[str, Any]:
                 previous_node=state.get("current_node"),
                 severity=candidate["severity"],
                 summary=(
-                    f"Shipment {candidate['shipment_id']} shows as delivered, but "
-                    f"{candidate['pending_kit_count']} kit(s) haven't been marked "
-                    f"as received yet at site {candidate['site_id']}."
+                    f"Shipment {candidate['shipment_id']} shows as delivered, but the "
+                    f"receipt hasn't been completed at site {candidate['site_id']}."
                 ),
             )
             db.add(issue)
@@ -324,7 +328,7 @@ def delivery_initial_node(state: AgentWorkflowState) -> dict[str, Any]:
 
     check_in_due = False
     if issue is not None:
-        is_waiting = issue.status == "Waiting for Response" and state["entrypoint"] in {"scan", "verify"}
+        is_waiting = issue.status == "Open" and state["entrypoint"] in {"scan", "verify"}
         if mismatch_exists and is_waiting:
             check_in_due = is_check_in_due(db, issue)
         issue.previous_node = state.get("current_node")
@@ -340,7 +344,7 @@ def delivery_initial_node(state: AgentWorkflowState) -> dict[str, Any]:
         )
     elif mismatch_exists:
         initial_message = (
-            "SAP/carrier indicate delivery while IRT receipt remains "
+            "Carrier tracking indicates delivery while the receipt remains "
             "incomplete; routing to Follow-up Node."
         )
     else:
@@ -368,7 +372,7 @@ def route_after_initial(state: AgentWorkflowState) -> str:
     if (
         state["mismatch_exists"]
         and issue is not None
-        and issue.status == "Waiting for Response"
+        and issue.status == "Open"
         and state["entrypoint"] in {"scan", "verify"}
         and not state.get("check_in_due")
     ):
@@ -440,7 +444,7 @@ def delivery_follow_up_node(state: AgentWorkflowState) -> dict[str, Any]:
         "follow_up_allowed": True,
         "email_sent": sent,
         "closing_origin": None if sent else "Follow-up Node",
-        "status": "waiting_for_response" if sent else "open",
+        "status": "open",
         "current_node": "Follow-up Node",
         "events": [
             *state["events"],
@@ -466,11 +470,11 @@ def route_after_follow_up(state: AgentWorkflowState) -> str:
 def wait_for_email_node(state: AgentWorkflowState) -> dict[str, Any]:
     issue = state["issue"]
     assert issue is not None
-    issue.status = "Waiting for Response"
+    issue.status = "Open"
     issue.current_node = "Follow-up Node"
     state["db"].commit()
     return {
-        "status": "waiting_for_response",
+        "status": "open",
         "current_node": "Follow-up Node",
         "events": [
             *state["events"],
@@ -757,10 +761,10 @@ def _add_initial_evidence(db, issue: Issue, candidate: dict[str, Any]) -> None:
         [
             IssueEvidence(
                 issue_id=issue.issue_id,
-                source_system="SAP / carrier",
+                source_system="Carrier tracking",
                 evidence_summary=(
                     f"Shipment {candidate['shipment_id']} status is "
-                    f"{candidate['sap_status']}; delivered at "
+                    f"{candidate['carrier_status']}; delivered at "
                     f"{candidate['delivered_at']}; carrier "
                     f"{candidate['carrier_name']}; tracking "
                     f"{candidate['tracking_number']}. Carrier proof of delivery "
@@ -769,17 +773,16 @@ def _add_initial_evidence(db, issue: Issue, candidate: dict[str, Any]) -> None:
             ),
             IssueEvidence(
                 issue_id=issue.issue_id,
-                source_system="IRT",
+                source_system="Site inventory",
                 evidence_summary=(
-                    f"{candidate['pending_kit_count']} kit(s) pending receipt: "
-                    f"{', '.join(candidate['pending_kit_ids'])}. Available kits "
-                    f"for the product at the site: "
+                    f"Kits pending receipt: {', '.join(candidate['pending_kit_ids'])}. "
+                    f"Available kits for the product at the site: "
                     f"{candidate['available_kit_count']}."
                 ),
             ),
             IssueEvidence(
                 issue_id=issue.issue_id,
-                source_system="CTMS / visits",
+                source_system="Visit schedule",
                 evidence_summary=(
                     f"Study {candidate['study_id']}; site "
                     f"{candidate['site_id']}; country {candidate['country']}; "

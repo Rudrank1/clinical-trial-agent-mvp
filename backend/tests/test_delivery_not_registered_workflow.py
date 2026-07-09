@@ -167,7 +167,7 @@ def test_scan_uses_main_risk_initial_and_follow_up_nodes(db, mock_email):
     issue_id = result["payload"]["issue_id"]
     nodes = [item["node"] for item in result["events"]]
 
-    assert result["status"] == "waiting_for_response"
+    assert result["status"] == "open"
     assert nodes == [
         "Main Node",
         "Supply/Logistics Node",
@@ -192,7 +192,7 @@ def test_repeated_scan_does_not_send_duplicate_email_while_waiting(
 
     repeated = orchestrator.run_full_agentic_workflow(db)[0]
 
-    assert repeated["status"] == "waiting_for_response"
+    assert repeated["status"] == "open"
     assert len(mock_email) == 1
     assert db.query(Issue).one().follow_up_count == 1
 
@@ -282,7 +282,7 @@ def test_overdue_check_in_resends_follow_up_then_escalates(db, mock_email):
     make_reminder_due(status="Sent")
     second = orchestrator.process_due_issue_checks(db)[0]
 
-    assert second["status"] == "waiting_for_response"
+    assert second["status"] == "open"
     assert [item["node"] for item in second["events"]] == [
         "Initial Node",
         "Follow-up Node",
@@ -332,7 +332,7 @@ def test_fixed_but_still_pending_repeats_once_then_escalates(
         entrypoint="email_response",
         response_text="I fixed the receipt.",
     )
-    assert second["status"] == "waiting_for_response"
+    assert second["status"] == "open"
     assert db.get(Issue, issue_id).follow_up_count == 2
 
     third = orchestrator.continue_issue(
@@ -368,7 +368,7 @@ def test_worker_sends_legacy_queued_follow_up_actions(db, mock_email):
     assert len(mock_email) == 2
 
 
-def test_mark_kits_received_with_explicit_ids_keeps_issue_open_until_all_fixed(db, mock_email):
+def test_mark_kits_received_resolves_the_whole_shipment_at_once(db, mock_email):
     seed_unregistered_delivery(db)
     db.add(
         Kit(
@@ -385,15 +385,49 @@ def test_mark_kits_received_with_explicit_ids_keeps_issue_open_until_all_fixed(d
     first = orchestrator.run_full_agentic_workflow(db)[0]
     issue_id = first["payload"]["issue_id"]
 
-    partial = orchestrator.resolve_delivery_issue(db, issue_id, kit_ids=["KIT-1"])
-    assert partial["status"] != "closed"
-    assert db.get(Issue, issue_id).status != "Closed"
-    assert db.get(Kit, ("STUDY-1", "KIT-1")).kit_status == "RECEIVED"
-    assert db.get(Kit, ("STUDY-1", "KIT-2")).kit_status == "PENDING_RECEIPT"
+    result = orchestrator.resolve_delivery_issue(db, issue_id)
 
-    final = orchestrator.resolve_delivery_issue(db, issue_id, kit_ids=["KIT-2"])
-    assert final["status"] == "closed"
+    assert result["status"] == "closed"
     assert db.get(Issue, issue_id).status == "Closed"
+    assert db.get(Kit, ("STUDY-1", "KIT-1")).kit_status == "RECEIVED"
+    assert db.get(Kit, ("STUDY-1", "KIT-2")).kit_status == "RECEIVED"
+
+
+def test_scoped_detection_only_processes_matching_study(db, mock_email):
+    seed_unregistered_delivery(db)
+    db.add(Study(study_id="STUDY-2", study_status="ACTIVE"))
+    db.add(Country(study_id="STUDY-2", country_id="US", country_name="United States"))
+    db.add(Site(study_id="STUDY-2", site_id="SITE-2", country_id="US", site_status="ACTIVE"))
+    db.add(
+        Shipment(
+            study_id="STUDY-2",
+            shipment_id="SHIP-2",
+            site_id="SITE-2",
+            logistics_status="DELIVERED",
+            delivered_at=datetime.utcnow() - timedelta(days=1),
+            carrier_name="Mock Carrier 2",
+            tracking_number="TRACK-2",
+            product_label="DRUG-B",
+        )
+    )
+    db.add(
+        Kit(
+            study_id="STUDY-2",
+            kit_id="KIT-3",
+            shipment_id="SHIP-2",
+            site_id="SITE-2",
+            kit_status="PENDING_RECEIPT",
+            product_label="DRUG-B",
+        )
+    )
+    db.commit()
+
+    results = orchestrator.run_full_agentic_workflow(db, study_id="STUDY-1")
+
+    assert len(results) == 1
+    issues = db.query(Issue).all()
+    assert len(issues) == 1
+    assert issues[0].reference_key.split(":")[1] == "STUDY-1"
 
 
 def test_update_shipment_status_correction_closes_issue(db, mock_email):

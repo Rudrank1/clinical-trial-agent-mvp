@@ -90,7 +90,8 @@ Style requirements:
 - Close with a normal sign-off from the Clinical Supply Monitoring Team.
 - Do not invent facts that are not in the supplied JSON.
 - Use short paragraphs with blank lines between them.
-- When explaining multiple items, use bullets.
+- Do NOT use markdown syntax of any kind — no asterisks, no bullet points, no bold or italic markers, no headers, no numbered lists. Write in plain flowing sentences only.
+- When mentioning several details, weave them into a sentence or short paragraph instead of listing them.
 - Do NOT return one dense paragraph.
 - PLEASE use line breaks and whitespace after greeting and before sign off.
 - This is follow-up attempt {follow_up_count}; if this is not the first attempt, politely acknowledge that this is a follow-up, but do not make it sound accusatory.
@@ -103,7 +104,6 @@ Required details to include when available:
 - Delivery timestamp
 - Carrier and tracking number
 - Product label
-- Pending kit count
 - Receipt instructions
 
 Receipt instructions:
@@ -181,7 +181,7 @@ def _candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
         "depot",
         "expected_delivery_date",
         "delivered_at",
-        "sap_status",
+        "carrier_status",
         "carrier_name",
         "tracking_number",
         "carrier_proof_of_delivery",
@@ -195,12 +195,22 @@ def _candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
     return {key: candidate.get(key) for key in keys}
 
 
+def _strip_markdown(text: str) -> str:
+    """Remove markdown syntax that leaked through despite the prompt instructions."""
+    clean = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+    clean = re.sub(r"\*\*(.+?)\*\*", r"\1", clean)
+    clean = re.sub(r"^\s*[*\-•]\s+", "", clean, flags=re.MULTILINE)
+    clean = re.sub(r"(?<!\w)\*(?!\*)", "", clean)
+    return clean
+
+
 def _natural_subject(subject: str, candidate: dict[str, Any]) -> str:
     """Remove internal workflow language from Gemini output and keep the subject useful."""
     clean = str(subject or "").strip()
     clean = re.sub(r"\[?CTA[-_ ]?ISSUE[-_ ]?\d*\]?", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"\bissue\s*#?\d+\b", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"\bworkflow\b", "", clean, flags=re.IGNORECASE)
+    clean = _strip_markdown(clean)
     clean = re.sub(r"\s+", " ", clean).strip(" -:|")
     if not clean:
         shipment_id = candidate.get("shipment_id") or "the recent shipment"
@@ -214,5 +224,6 @@ def _natural_body(body: str) -> str:
     clean = re.sub(r"CTA[-_ ]?ISSUE[-_ ]?\d+", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"\bIssue ID:\s*\d+\s*", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"\bworkflow node\b", "process step", clean, flags=re.IGNORECASE)
-    clean = clean.replace("```", "").strip()
+    clean = clean.replace("```", "")
+    clean = _strip_markdown(clean).strip()
     return clean

@@ -1,21 +1,27 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getDashboard, getStudies, detectIssues, checkDueIssues } from '../api'
+import {
+  getDashboard,
+  getStudies,
+  getCountries,
+  getSites,
+  detectIssues,
+  checkDueIssues,
+} from '../api'
 import { summarizeDetectIssues, summarizeCheckDueIssues } from '../format'
 import StatusBanner from '../components/StatusBanner'
 
-const STAT_LABELS = [
-  ['studies', 'Studies'],
-  ['countries', 'Countries'],
-  ['sites', 'Sites'],
-  ['patients', 'Patients'],
-  ['shipments', 'Shipments'],
-  ['kits', 'Kits'],
+const STAT_CARDS = [
+  ['studies', 'Studies', '/studies'],
+  ['countries', 'Countries', '/countries'],
+  ['sites', 'Sites', '/sites'],
+  ['patients', 'Patients', '/patients'],
+  ['shipments', 'Shipments', '/shipments'],
+  ['kits', 'Kits', '/kits'],
 ]
 
 const STATUS_BADGE = {
   Open: 'text-bg-primary',
-  'Waiting for Response': 'text-bg-warning',
   Escalated: 'text-bg-danger',
   Closed: 'text-bg-secondary',
 }
@@ -27,6 +33,12 @@ function Dashboard() {
   const [error, setError] = useState(null)
   const [pendingAction, setPendingAction] = useState(null)
   const [successMessage, setSuccessMessage] = useState(null)
+
+  const [scopeStudyId, setScopeStudyId] = useState('')
+  const [scopeCountryId, setScopeCountryId] = useState('')
+  const [scopeSiteId, setScopeSiteId] = useState('')
+  const [scopeCountries, setScopeCountries] = useState([])
+  const [scopeSites, setScopeSites] = useState([])
 
   const refresh = async () => {
     setLoading(true)
@@ -46,6 +58,23 @@ function Dashboard() {
     refresh()
   }, [])
 
+  useEffect(() => {
+    getCountries({ study_id: scopeStudyId || undefined })
+      .then(setScopeCountries)
+      .catch((err) => setError(err.message))
+    setScopeCountryId('')
+    setScopeSiteId('')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopeStudyId])
+
+  useEffect(() => {
+    getSites({ study_id: scopeStudyId || undefined, country_id: scopeCountryId || undefined })
+      .then(setScopeSites)
+      .catch((err) => setError(err.message))
+    setScopeSiteId('')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopeCountryId])
+
   const runAction = async (key, fn, summarize) => {
     setPendingAction(key)
     setError(null)
@@ -61,6 +90,18 @@ function Dashboard() {
     }
   }
 
+  const runDetect = () =>
+    runAction(
+      'detect',
+      () =>
+        detectIssues({
+          study_id: scopeStudyId || undefined,
+          country_id: scopeCountryId || undefined,
+          site_id: scopeSiteId || undefined,
+        }),
+      summarizeDetectIssues,
+    )
+
   return (
     <div>
       <h1 className="mb-4">Dashboard</h1>
@@ -69,14 +110,14 @@ function Dashboard() {
       <StatusBanner variant="success" message={successMessage} onDismiss={() => setSuccessMessage(null)} />
 
       <div className="row g-3 mb-4">
-        {STAT_LABELS.map(([key, label]) => (
+        {STAT_CARDS.map(([key, label, to]) => (
           <div className="col-6 col-md-2" key={key}>
-            <div className="card text-center h-100">
+            <Link to={to} className="card text-center h-100 text-decoration-none stat-card">
               <div className="card-body">
                 <div className="fs-3 fw-semibold">{dashboard ? dashboard.totals[key] : '—'}</div>
                 <div className="text-muted small">{label}</div>
               </div>
-            </div>
+            </Link>
           </div>
         ))}
       </div>
@@ -94,26 +135,74 @@ function Dashboard() {
         </div>
       </div>
 
-      <div className="d-flex flex-wrap gap-2 mb-4">
-        <button
-          type="button"
-          className="btn btn-primary"
-          disabled={pendingAction !== null}
-          onClick={() => runAction('detect', detectIssues, summarizeDetectIssues)}
-        >
-          {pendingAction === 'detect' ? 'Detecting…' : 'Detect Issues'}
-        </button>
-        <button
-          type="button"
-          className="btn btn-outline-primary"
-          disabled={pendingAction !== null}
-          onClick={() => runAction('check-due', checkDueIssues, summarizeCheckDueIssues)}
-        >
-          {pendingAction === 'check-due' ? 'Checking…' : 'Check Due Issues'}
-        </button>
-        <Link className="btn btn-outline-secondary" to="/issues">
-          View Issues
-        </Link>
+      <div className="card mb-4">
+        <div className="card-header">Detect issues</div>
+        <div className="card-body">
+          <div className="row g-2 mb-3">
+            <div className="col-md-4">
+              <label className="form-label small mb-1">Study</label>
+              <select
+                className="form-select form-select-sm"
+                value={scopeStudyId}
+                onChange={(e) => setScopeStudyId(e.target.value)}
+              >
+                <option value="">All studies</option>
+                {studies.map((study) => (
+                  <option key={study.study_id} value={study.study_id}>
+                    {study.study_id}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="col-md-4">
+              <label className="form-label small mb-1">Country</label>
+              <select
+                className="form-select form-select-sm"
+                value={scopeCountryId}
+                onChange={(e) => setScopeCountryId(e.target.value)}
+              >
+                <option value="">All countries</option>
+                {scopeCountries.map((country) => (
+                  <option key={`${country.study_id}-${country.country_id}`} value={country.country_id}>
+                    {country.country_name} ({country.country_id})
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="col-md-4">
+              <label className="form-label small mb-1">Site</label>
+              <select
+                className="form-select form-select-sm"
+                value={scopeSiteId}
+                onChange={(e) => setScopeSiteId(e.target.value)}
+              >
+                <option value="">All sites</option>
+                {scopeSites.map((site) => (
+                  <option key={`${site.study_id}-${site.site_id}`} value={site.site_id}>
+                    {site.site_id}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="d-flex flex-wrap gap-2">
+            <button type="button" className="btn btn-primary" disabled={pendingAction !== null} onClick={runDetect}>
+              {pendingAction === 'detect' ? 'Detecting…' : 'Detect Issues'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline-primary"
+              disabled={pendingAction !== null}
+              onClick={() => runAction('check-due', checkDueIssues, summarizeCheckDueIssues)}
+            >
+              {pendingAction === 'check-due' ? 'Checking…' : 'Check Due Issues'}
+            </button>
+            <Link className="btn btn-outline-secondary" to="/issues">
+              View Issues
+            </Link>
+          </div>
+        </div>
       </div>
 
       <h2 className="h5 mb-2">Studies</h2>

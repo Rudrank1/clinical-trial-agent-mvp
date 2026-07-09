@@ -4,6 +4,11 @@ import IssuesList from './pages/IssuesList'
 import IssueDetail from './pages/IssueDetail'
 import Studies from './pages/Studies'
 import StudyDetail from './pages/StudyDetail'
+import Countries from './pages/Countries'
+import Sites from './pages/Sites'
+import Patients from './pages/Patients'
+import Shipments from './pages/Shipments'
+import Kits from './pages/Kits'
 import Admin from './pages/Admin'
 
 const navLinkClass = ({ isActive }) => `nav-link${isActive ? ' active fw-semibold' : ''}`
@@ -41,6 +46,11 @@ function App() {
           <Route path="/issues/:issueId" element={<IssueDetail />} />
           <Route path="/studies" element={<Studies />} />
           <Route path="/studies/:studyId" element={<StudyDetail />} />
+          <Route path="/countries" element={<Countries />} />
+          <Route path="/sites" element={<Sites />} />
+          <Route path="/patients" element={<Patients />} />
+          <Route path="/shipments" element={<Shipments />} />
+          <Route path="/kits" element={<Kits />} />
           <Route path="/admin" element={<Admin />} />
         </Routes>
       </div>

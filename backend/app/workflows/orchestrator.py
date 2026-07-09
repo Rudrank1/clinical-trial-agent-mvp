@@ -209,8 +209,16 @@ def _result(state: AgentWorkflowState) -> WorkflowResult:
     }
 
 
-def run_full_agentic_workflow(db: Session) -> list[WorkflowResult]:
-    detected_candidates = find_delivery_candidates(db)
+def run_full_agentic_workflow(
+    db: Session,
+    *,
+    study_id: str | None = None,
+    country_id: str | None = None,
+    site_id: str | None = None,
+) -> list[WorkflowResult]:
+    detected_candidates = find_delivery_candidates(
+        db, study_id=study_id, country_id=country_id, site_id=site_id
+    )
     candidates = [
         candidate
         for candidate in detected_candidates
@@ -346,7 +354,7 @@ def process_email_replies(db: Session) -> list[WorkflowResult]:
             complete_reply_processing(reply)
             continue
         issue = resolve_issue_for_reply(db, reply)
-        if issue is None or issue.status not in {"Open", "Waiting for Response"}:
+        if issue is None or issue.status != "Open":
             complete_reply_processing(reply)
             continue
         record_received_reply(db, reply, issue)
@@ -373,7 +381,7 @@ def process_due_issue_checks(db: Session) -> list[WorkflowResult]:
     issues = (
         db.query(Issue)
         .filter(Issue.issue_type == "Delivery Not Registered")
-        .filter(Issue.status == "Waiting for Response")
+        .filter(Issue.status == "Open")
         .all()
     )
     results: list[WorkflowResult] = []
@@ -390,16 +398,18 @@ def process_due_issue_checks(db: Session) -> list[WorkflowResult]:
     return results
 
 
-def resolve_delivery_issue(db: Session, issue_id: int, kit_ids: list[str] | None = None) -> WorkflowResult:
-    """Mark this issue's pending kits (or a chosen subset) as received, then reverify/close it.
+def resolve_delivery_issue(db: Session, issue_id: int) -> WorkflowResult:
+    """Mark this issue's shipment as received, then reverify/close it.
 
     Lets the UI fix a Delivery Not Registered issue directly instead of
     requiring a real inventory system (or manual SQL) to clear the mismatch.
+    A shipment's receipt is either complete or it isn't, so this always marks
+    every currently-pending kit on the shipment at once.
     """
     issue = db.get(Issue, issue_id)
     if issue is None or issue.issue_type != "Delivery Not Registered":
         raise ValueError(f"Delivery Not Registered issue {issue_id} not found.")
-    mark_kits_received(db, issue, kit_ids=kit_ids)
+    mark_kits_received(db, issue)
     return continue_issue(db, issue_id=issue_id, entrypoint="verify")
 
 

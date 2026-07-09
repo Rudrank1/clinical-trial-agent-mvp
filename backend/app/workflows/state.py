@@ -34,7 +34,7 @@ class AgentWorkflowState(TypedDict):
     response_text: str | None
     response_outcome: DecisionOutcome | None
     closing_origin: ClosingOrigin | None
-    status: Literal["closed", "open", "waiting_for_response", "escalated"]
+    status: Literal["closed", "open", "escalated"]
     current_node: str
     events: list[WorkflowEvent]
 

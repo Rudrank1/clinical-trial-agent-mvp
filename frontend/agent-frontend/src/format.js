@@ -1,7 +1,6 @@
 const STATUS_LABELS = {
   closed: 'closed',
   open: 'open',
-  waiting_for_response: 'waiting for response',
   escalated: 'escalated',
 }
 

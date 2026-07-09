@@ -38,8 +38,10 @@ class SiteResponseRequest(BaseModel):
     message: str = Field(min_length=1, max_length=5000)
 
 
-class MarkReceivedRequest(BaseModel):
-    kit_ids: list[str] | None = None
+class DetectionScopeRequest(BaseModel):
+    study_id: str | None = None
+    country_id: str | None = None
+    site_id: str | None = None
 
 
 class ShipmentUpdateRequest(BaseModel):
@@ -69,9 +71,20 @@ def seed_data():
 
 
 @app.post("/workflows/run")
-def run_complete_agentic_workflow(db: Session = Depends(get_db)):
-    """Main Node -> Risk Node -> Issue workflow."""
-    return {"results": run_full_agentic_workflow(db)}
+def run_complete_agentic_workflow(
+    request: DetectionScopeRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    """Main Node -> Risk Node -> Issue workflow, optionally scoped to a study/country/site."""
+    scope = request or DetectionScopeRequest()
+    return {
+        "results": run_full_agentic_workflow(
+            db,
+            study_id=scope.study_id,
+            country_id=scope.country_id,
+            site_id=scope.site_id,
+        )
+    }
 
 
 @app.post("/workflows/delivery_not_registered/issues/{issue_id}/respond")
@@ -104,19 +117,15 @@ def verify_delivery_issue(issue_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/workflows/delivery_not_registered/issues/{issue_id}/mark-received")
-def mark_delivery_issue_received(
-    issue_id: int,
-    request: MarkReceivedRequest | None = None,
-    db: Session = Depends(get_db),
-):
-    """Mark the issue's pending kits (or a chosen subset) as received and reverify/close it.
+def mark_delivery_issue_received(issue_id: int, db: Session = Depends(get_db)):
+    """Mark the issue's shipment as received and reverify/close it.
 
     Lets the UI fix the underlying mismatch directly, without a real
-    inventory system or manual SQL.
+    inventory system or manual SQL. A shipment's receipt is either complete
+    or it isn't, so this always marks the whole shipment's pending kits.
     """
-    kit_ids = request.kit_ids if request else None
     try:
-        return resolve_delivery_issue(db, issue_id, kit_ids=kit_ids)
+        return resolve_delivery_issue(db, issue_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -181,7 +190,7 @@ def get_dashboard(db: Session = Depends(get_db)):
     )
     issues_by_status = {
         status: status_counts.get(status, 0)
-        for status in ("Open", "Waiting for Response", "Escalated", "Closed")
+        for status in ("Open", "Escalated", "Closed")
     }
     return {"totals": totals, "issues_by_status": issues_by_status}
 
@@ -196,7 +205,7 @@ def get_studies(db: Session = Depends(get_db)):
         open_issues = (
             db.query(Issue)
             .filter(Issue.reference_key.like(f"%:{study.study_id}:%"))
-            .filter(Issue.status.in_(["Open", "Waiting for Response", "Escalated"]))
+            .filter(Issue.status.in_(["Open", "Escalated"]))
             .count()
         )
         result.append(
@@ -239,6 +248,128 @@ def get_study_sites(study_id: str, db: Session = Depends(get_db)):
             for site in sites
         ],
     }
+
+
+@app.get("/countries")
+def get_countries(study_id: str | None = None, db: Session = Depends(get_db)):
+    query = db.query(Country)
+    if study_id:
+        query = query.filter(Country.study_id == study_id)
+    countries = query.order_by(Country.study_id, Country.country_id).all()
+
+    return [
+        {
+            "study_id": country.study_id,
+            "country_id": country.country_id,
+            "country_name": country.country_name,
+            "country_status": country.country_status,
+            "sites": db.query(Site)
+            .filter(Site.study_id == country.study_id, Site.country_id == country.country_id)
+            .count(),
+            "patients": db.query(Subject)
+            .join(Site, (Site.study_id == Subject.study_id) & (Site.site_id == Subject.site_id))
+            .filter(Site.study_id == country.study_id, Site.country_id == country.country_id)
+            .count(),
+        }
+        for country in countries
+    ]
+
+
+@app.get("/sites")
+def get_sites(study_id: str | None = None, country_id: str | None = None, db: Session = Depends(get_db)):
+    query = db.query(Site)
+    if study_id:
+        query = query.filter(Site.study_id == study_id)
+    if country_id:
+        query = query.filter(Site.country_id == country_id)
+    sites = query.order_by(Site.study_id, Site.site_id).all()
+
+    return [
+        {
+            "study_id": site.study_id,
+            "site_id": site.site_id,
+            "country_id": site.country_id,
+            "site_status": site.site_status,
+            "institution_name": site.institution_name,
+            "investigator_name": site.investigator_name,
+            "patients": db.query(Subject)
+            .filter(Subject.study_id == site.study_id, Subject.site_id == site.site_id)
+            .count(),
+            "shipments": db.query(Shipment)
+            .filter(Shipment.study_id == site.study_id, Shipment.site_id == site.site_id)
+            .count(),
+        }
+        for site in sites
+    ]
+
+
+@app.get("/patients")
+def get_patients(study_id: str | None = None, site_id: str | None = None, db: Session = Depends(get_db)):
+    query = db.query(Subject)
+    if study_id:
+        query = query.filter(Subject.study_id == study_id)
+    if site_id:
+        query = query.filter(Subject.site_id == site_id)
+    subjects = query.order_by(Subject.study_id, Subject.subject_id).all()
+
+    return [
+        {
+            "study_id": subject.study_id,
+            "subject_id": subject.subject_id,
+            "site_id": subject.site_id,
+            "subject_status": subject.subject_status,
+            "next_visit_at": subject.next_visit_at,
+        }
+        for subject in subjects
+    ]
+
+
+@app.get("/shipments")
+def get_shipments(study_id: str | None = None, site_id: str | None = None, db: Session = Depends(get_db)):
+    query = db.query(Shipment)
+    if study_id:
+        query = query.filter(Shipment.study_id == study_id)
+    if site_id:
+        query = query.filter(Shipment.site_id == site_id)
+    shipments = query.order_by(Shipment.study_id, Shipment.shipment_id).all()
+
+    return [
+        {
+            "study_id": shipment.study_id,
+            "shipment_id": shipment.shipment_id,
+            "site_id": shipment.site_id,
+            "logistics_status": shipment.logistics_status,
+            "delivered_at": shipment.delivered_at,
+            "carrier_name": shipment.carrier_name,
+            "tracking_number": shipment.tracking_number,
+            "product_label": shipment.product_label,
+        }
+        for shipment in shipments
+    ]
+
+
+@app.get("/kits")
+def get_kits(study_id: str | None = None, shipment_id: str | None = None, db: Session = Depends(get_db)):
+    query = db.query(Kit)
+    if study_id:
+        query = query.filter(Kit.study_id == study_id)
+    if shipment_id:
+        query = query.filter(Kit.shipment_id == shipment_id)
+    kits = query.order_by(Kit.study_id, Kit.kit_id).all()
+
+    return [
+        {
+            "study_id": kit.study_id,
+            "kit_id": kit.kit_id,
+            "shipment_id": kit.shipment_id,
+            "site_id": kit.site_id,
+            "kit_status": kit.kit_status,
+            "dispensed_at": kit.dispensed_at,
+            "product_label": kit.product_label,
+            "expiration_at": kit.expiration_at,
+        }
+        for kit in kits
+    ]
 
 
 @app.get("/issues")

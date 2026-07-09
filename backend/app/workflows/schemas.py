@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Literal, TypedDict
 
 
-WorkflowStatus = Literal["closed", "open", "waiting_for_response", "escalated"]
+WorkflowStatus = Literal["closed", "open", "escalated"]
 
 
 class WorkflowEvent(TypedDict):
