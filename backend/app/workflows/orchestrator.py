@@ -33,6 +33,12 @@ from app.workflows.delivery_not_registered import (
     wait_for_email_node,
     FOLLOW_UP_INTERVAL_SECONDS,
 )
+from app.workflows.shipment_delays import (
+    find_shipment_delay_candidates,
+    shipment_delay_closing_node,
+    shipment_delay_follow_up_node,
+    shipment_delay_initial_node,
+)
 from app.workflows.main_node import main_node, route_from_main
 from app.workflows.risk_nodes import (
     forecasting_node,
@@ -43,6 +49,12 @@ from app.workflows.risk_nodes import (
 )
 from app.workflows.schemas import WorkflowResult
 from app.workflows.state import AgentWorkflowState, event
+
+# Which follow-up action's due_at governs each issue type's check-in timer.
+ACTION_TYPE_BY_ISSUE_TYPE = {
+    "Delivery Not Registered": "RECEIPT_REMINDER",
+    "Shipment Delays": "DELAY_STATUS_REQUEST",
+}
 
 
 def route_entrypoint(state: AgentWorkflowState) -> str:
@@ -65,6 +77,14 @@ def finish_without_issue_node(state: AgentWorkflowState) -> dict[str, Any]:
     }
 
 
+def route_verify_by_issue_type(state: AgentWorkflowState) -> str:
+    """Dispatch a `verify`/resume load to the right issue type's Initial Node."""
+    issue = state.get("issue")
+    if issue is not None and issue.issue_type == "Shipment Delays":
+        return "shipment_delay_initial_node"
+    return "delivery_initial_node"
+
+
 def build_agentic_workflow_graph():
     graph = StateGraph(AgentWorkflowState)
     graph.add_node("main_node", main_node)
@@ -74,9 +94,12 @@ def build_agentic_workflow_graph():
     graph.add_node("software_node", software_node)
     graph.add_node("delivery_initial_node", delivery_initial_node)
     graph.add_node("delivery_follow_up_node", delivery_follow_up_node)
+    graph.add_node("shipment_delay_initial_node", shipment_delay_initial_node)
+    graph.add_node("shipment_delay_follow_up_node", shipment_delay_follow_up_node)
     graph.add_node("wait_for_email", wait_for_email_node)
     graph.add_node("delivery_decision_node", delivery_decision_node)
     graph.add_node("delivery_closing_node", delivery_closing_node)
+    graph.add_node("shipment_delay_closing_node", shipment_delay_closing_node)
     graph.add_node("load_issue_for_response", load_issue_for_event_node)
     graph.add_node("load_issue_for_timeout", load_issue_for_event_node)
     graph.add_node("load_issue_for_verify", load_issue_for_event_node)
@@ -115,25 +138,46 @@ def build_agentic_workflow_graph():
             route_from_risk_node,
             {
                 "delivery_initial_node": "delivery_initial_node",
+                "shipment_delay_initial_node": "shipment_delay_initial_node",
                 "finish_without_issue": "finish_without_issue",
             },
         )
 
+    # route_after_initial / route_after_follow_up return generic keys
+    # ("wait"/"follow_up"/"closing") — each issue type supplies its own
+    # path_map here to resolve them to its own nodes.
     graph.add_conditional_edges(
         "delivery_initial_node",
         route_after_initial,
         {
-            "delivery_follow_up_node": "delivery_follow_up_node",
-            "delivery_closing_node": "delivery_closing_node",
-            "wait_for_email": "wait_for_email",
+            "follow_up": "delivery_follow_up_node",
+            "closing": "delivery_closing_node",
+            "wait": "wait_for_email",
         },
     )
     graph.add_conditional_edges(
         "delivery_follow_up_node",
         route_after_follow_up,
         {
-            "wait_for_email": "wait_for_email",
-            "delivery_closing_node": "delivery_closing_node",
+            "wait": "wait_for_email",
+            "closing": "delivery_closing_node",
+        },
+    )
+    graph.add_conditional_edges(
+        "shipment_delay_initial_node",
+        route_after_initial,
+        {
+            "follow_up": "shipment_delay_follow_up_node",
+            "closing": "shipment_delay_closing_node",
+            "wait": "wait_for_email",
+        },
+    )
+    graph.add_conditional_edges(
+        "shipment_delay_follow_up_node",
+        route_after_follow_up,
+        {
+            "wait": "wait_for_email",
+            "closing": "shipment_delay_closing_node",
         },
     )
     graph.add_edge("load_issue_for_response", "delivery_decision_node")
@@ -147,10 +191,18 @@ def build_agentic_workflow_graph():
     )
     graph.add_edge("load_issue_for_timeout", "timeout_node")
     graph.add_edge("timeout_node", "delivery_closing_node")
-    graph.add_edge("load_issue_for_verify", "delivery_initial_node")
+    graph.add_conditional_edges(
+        "load_issue_for_verify",
+        route_verify_by_issue_type,
+        {
+            "delivery_initial_node": "delivery_initial_node",
+            "shipment_delay_initial_node": "shipment_delay_initial_node",
+        },
+    )
 
     graph.add_edge("wait_for_email", END)
     graph.add_edge("delivery_closing_node", END)
+    graph.add_edge("shipment_delay_closing_node", END)
     graph.add_edge("finish_without_issue", END)
     return graph.compile()
 
@@ -217,6 +269,8 @@ def run_full_agentic_workflow(
     site_id: str | None = None,
 ) -> list[WorkflowResult]:
     detected_candidates = find_delivery_candidates(
+        db, study_id=study_id, country_id=country_id, site_id=site_id
+    ) + find_shipment_delay_candidates(
         db, study_id=study_id, country_id=country_id, site_id=site_id
     )
     candidates = [
@@ -370,7 +424,7 @@ def process_email_replies(db: Session) -> list[WorkflowResult]:
 
 
 def process_due_issue_checks(db: Session) -> list[WorkflowResult]:
-    """Recheck every Delivery Not Registered issue whose next check-in has arrived.
+    """Recheck every open issue (any type) whose next check-in has arrived.
 
     This is the primary driver now that the workflow detects fixes by polling
     the database instead of waiting on a site reply: each due issue is
@@ -378,15 +432,11 @@ def process_due_issue_checks(db: Session) -> list[WorkflowResult]:
     follow-up if it's still pending and under the follow-up cap, or escalates
     once the cap is reached.
     """
-    issues = (
-        db.query(Issue)
-        .filter(Issue.issue_type == "Delivery Not Registered")
-        .filter(Issue.status == "Open")
-        .all()
-    )
+    issues = db.query(Issue).filter(Issue.status == "Open").all()
     results: list[WorkflowResult] = []
     for issue in issues:
-        if not is_check_in_due(db, issue):
+        action_type = ACTION_TYPE_BY_ISSUE_TYPE.get(issue.issue_type)
+        if action_type is None or not is_check_in_due(db, issue, action_type=action_type):
             continue
         results.append(
             continue_issue(

@@ -240,6 +240,32 @@ function IssueDetail() {
         </div>
       )}
 
+      {issue.delay_context && (
+        <div className="card mb-4">
+          <div className="card-header">Delayed shipment</div>
+          <div className="card-body">
+            <dl className="row mb-0 small">
+              <dt className="col-sm-3">Shipment</dt>
+              <dd className="col-sm-9">{issue.delay_context.shipment.shipment_id}</dd>
+              <dt className="col-sm-3">Logistics status</dt>
+              <dd className="col-sm-9">{issue.delay_context.shipment.logistics_status}</dd>
+              <dt className="col-sm-3">Requested</dt>
+              <dd className="col-sm-9">{formatDate(issue.delay_context.shipment.requested_at)}</dd>
+              <dt className="col-sm-3">Shipped</dt>
+              <dd className="col-sm-9">{formatDate(issue.delay_context.shipment.shipped_at)}</dd>
+              <dt className="col-sm-3">Days in transit</dt>
+              <dd className="col-sm-9">{issue.delay_context.shipment.days_in_transit ?? '—'}</dd>
+              <dt className="col-sm-3">Carrier</dt>
+              <dd className="col-sm-9">{issue.delay_context.shipment.carrier_name}</dd>
+              <dt className="col-sm-3">Tracking number</dt>
+              <dd className="col-sm-9">{issue.delay_context.shipment.tracking_number}</dd>
+              <dt className="col-sm-3">Product</dt>
+              <dd className="col-sm-9">{issue.delay_context.shipment.product_label}</dd>
+            </dl>
+          </div>
+        </div>
+      )}
+
       <div className="card mb-4">
         <div className="card-header">Evidence</div>
         <ul className="list-group list-group-flush">

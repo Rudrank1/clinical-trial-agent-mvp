@@ -4,10 +4,10 @@ from datetime import datetime, timedelta
 import os
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.models.agent_system import Issue, IssueAction, IssueEvidence
-from app.models.source_systems import Country, Kit, Shipment, Site, Study, Visit
+from app.models.source_systems import Country, Kit, Shipment, Site, Study
 from app.services.gmail_toolkit_service import (
     RECIPIENT_EMAIL,
     ReceivedReply,
@@ -16,6 +16,7 @@ from app.services.gmail_toolkit_service import (
 )
 from app.services.gemini_service import generate_delivery_followup_email
 from app.services.response_classifier import classify_delivery_reply
+from app.workflows.risk_nodes import count_available_kits, count_upcoming_drug_visits
 from app.workflows.state import AgentWorkflowState, event
 
 ISSUE_TYPE = "Delivery Not Registered"
@@ -101,33 +102,11 @@ def _build_candidate(db, shipment, site, country, study) -> dict[str, Any]:
         if shipment_indicates_delivered
         else []
     )
-    available_kit_count = int(
-        db.scalar(
-            select(func.count())
-            .select_from(Kit)
-            .where(Kit.study_id == shipment.study_id)
-            .where(Kit.site_id == shipment.site_id)
-            .where(Kit.product_label == shipment.product_label)
-            .where(Kit.kit_status.in_(["AVAILABLE", "RECEIVED"]))
-            .where(Kit.dispensed_at.is_(None))
-        )
-        or 0
+    available_kit_count = count_available_kits(
+        db, study_id=shipment.study_id, site_id=shipment.site_id, product_label=shipment.product_label
     )
-    now = datetime.utcnow()
-    upcoming_visit_count = int(
-        db.scalar(
-            select(func.count())
-            .select_from(Visit)
-            .where(Visit.study_id == shipment.study_id)
-            .where(Visit.site_id == shipment.site_id)
-            .where(Visit.drug_required.is_(True))
-            .where(Visit.visit_at >= now)
-            .where(
-                Visit.visit_at
-                <= now + timedelta(days=UPCOMING_VISIT_WINDOW_DAYS)
-            )
-        )
-        or 0
+    upcoming_visit_count = count_upcoming_drug_visits(
+        db, study_id=shipment.study_id, site_id=shipment.site_id, window_days=UPCOMING_VISIT_WINDOW_DAYS
     )
     severity = (
         "Critical"
@@ -137,6 +116,7 @@ def _build_candidate(db, shipment, site, country, study) -> dict[str, Any]:
         else "Medium"
     )
     return {
+        "issue_type": "Delivery Not Registered",
         "reference_key": (
             f"delivery_not_registered:{shipment.study_id}:"
             f"{shipment.shipment_id}"
@@ -178,17 +158,20 @@ def _build_candidate(db, shipment, site, country, study) -> dict[str, Any]:
     }
 
 
-def is_check_in_due(db, issue: Issue) -> bool:
+def is_check_in_due(db, issue: Issue, *, action_type: str) -> bool:
     """Whether it's time to recheck this issue's underlying database state.
 
-    An open issue gets rechecked on a timer (the latest reminder's due_at)
-    rather than waiting on a site reply, since the workflow now detects
-    fixes by polling the source data directly.
+    An open issue gets rechecked on a timer (the latest follow-up action's
+    due_at) rather than waiting on a site reply, since the workflow now
+    detects fixes by polling the source data directly. `action_type` is
+    whichever follow-up action this issue type sends (e.g. RECEIPT_REMINDER
+    for Delivery Not Registered, DELAY_STATUS_REQUEST for Shipment Delays) —
+    shared across issue types, not just this one.
     """
     reminder = (
         db.query(IssueAction)
         .filter(IssueAction.issue_id == issue.issue_id)
-        .filter(IssueAction.action_type == "RECEIPT_REMINDER")
+        .filter(IssueAction.action_type == action_type)
         .filter(IssueAction.status == "Sent")
         .order_by(IssueAction.action_id.desc())
         .first()
@@ -330,7 +313,7 @@ def delivery_initial_node(state: AgentWorkflowState) -> dict[str, Any]:
     if issue is not None:
         is_waiting = issue.status == "Open" and state["entrypoint"] in {"scan", "verify"}
         if mismatch_exists and is_waiting:
-            check_in_due = is_check_in_due(db, issue)
+            check_in_due = is_check_in_due(db, issue, action_type="RECEIPT_REMINDER")
         issue.previous_node = state.get("current_node")
         issue.current_node = "Initial Node"
         db.commit()
@@ -368,6 +351,13 @@ def delivery_initial_node(state: AgentWorkflowState) -> dict[str, Any]:
 
 
 def route_after_initial(state: AgentWorkflowState) -> str:
+    """Shared by every issue type's Initial Node.
+
+    Returns a generic key ("wait"/"follow_up"/"closing") — each issue type's
+    own path_map in orchestrator.py resolves it to that issue's actual nodes,
+    so this one function works for Delivery Not Registered, Shipment Delays,
+    and any future Initial Node built the same way.
+    """
     issue = state.get("issue")
     if (
         state["mismatch_exists"]
@@ -376,12 +366,8 @@ def route_after_initial(state: AgentWorkflowState) -> str:
         and state["entrypoint"] in {"scan", "verify"}
         and not state.get("check_in_due")
     ):
-        return "wait_for_email"
-    return (
-        "delivery_follow_up_node"
-        if state["mismatch_exists"]
-        else "delivery_closing_node"
-    )
+        return "wait"
+    return "follow_up" if state["mismatch_exists"] else "closing"
 
 
 def delivery_follow_up_node(state: AgentWorkflowState) -> dict[str, Any]:
@@ -425,7 +411,7 @@ def delivery_follow_up_node(state: AgentWorkflowState) -> dict[str, Any]:
         "ai_prompt": draft.prompt_name,
         "generated_by": "gemini",
     }
-    sent = _send_and_record(
+    sent = send_and_record(
         state,
         issue=issue,
         action_type="RECEIPT_REMINDER",
@@ -462,9 +448,10 @@ def delivery_follow_up_node(state: AgentWorkflowState) -> dict[str, Any]:
 
 
 def route_after_follow_up(state: AgentWorkflowState) -> str:
+    """Shared by every issue type's Follow-up Node — see route_after_initial."""
     if not state["follow_up_allowed"] or not state["email_sent"]:
-        return "delivery_closing_node"
-    return "wait_for_email"
+        return "closing"
+    return "wait"
 
 
 def wait_for_email_node(state: AgentWorkflowState) -> dict[str, Any]:
@@ -591,7 +578,7 @@ def delivery_closing_node(state: AgentWorkflowState) -> dict[str, Any]:
         message = f"Escalated because Closing Node was reached from {origin}."
     state["db"].commit()
 
-    _send_and_record(
+    send_and_record(
         state,
         issue=issue,
         action_type=action_type,
@@ -610,13 +597,20 @@ def delivery_closing_node(state: AgentWorkflowState) -> dict[str, Any]:
 
 
 def load_issue_for_event_node(state: AgentWorkflowState) -> dict[str, Any]:
+    """Shared by every issue type's response/timeout/verify loader.
+
+    Only resolves the issue_id to an Issue row — it deliberately doesn't
+    prefetch a candidate, since it doesn't know which issue type it's
+    loading for. Each issue type's own Initial Node already rebuilds its
+    candidate from scratch when handed an issue with no candidate, so that's
+    where the issue-type-specific context lookup belongs.
+    """
     issue_id = state["issue_id"]
     issue = state["db"].get(Issue, issue_id) if issue_id else None
-    if issue is None or issue.issue_type != ISSUE_TYPE:
-        raise ValueError(f"Delivery Not Registered issue {issue_id} not found.")
+    if issue is None:
+        raise ValueError(f"Issue {issue_id} not found.")
     return {
         "issue": issue,
-        "candidate": _context_for_issue(state["db"], issue),
         "current_node": issue.current_node or "Initial Node",
     }
 
@@ -794,7 +788,7 @@ def _add_initial_evidence(db, issue: Issue, candidate: dict[str, Any]) -> None:
     )
 
 
-def _send_and_record(
+def send_and_record(
     state: AgentWorkflowState,
     *,
     issue: Issue,

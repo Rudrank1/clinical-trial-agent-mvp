@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.workflows.risk_nodes import delivery_mismatch_exists
+from app.workflows.risk_nodes import delivery_mismatch_exists, shipment_delay_exists
 from app.workflows.state import AgentWorkflowState, RiskType, event
 
 
 def _has_supply_logistics_risk(state: AgentWorkflowState) -> bool:
-    return delivery_mismatch_exists(state["db"])
+    db = state["db"]
+    return delivery_mismatch_exists(db) or shipment_delay_exists(db)
 
 
 # Add new category-level detectors here as their source data becomes available.

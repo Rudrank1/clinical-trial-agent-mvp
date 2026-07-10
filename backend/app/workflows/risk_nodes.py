@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Any
 
-from app.models.source_systems import Kit, Shipment
+from sqlalchemy import func, select
+
+from app.models.source_systems import Kit, Shipment, Visit
 from app.workflows.state import AgentWorkflowState, event
 
 
 def delivery_mismatch_exists(db) -> bool:
-    """Shared Supply/Logistics signal: SAP/carrier delivered, IRT receipt still pending."""
+    """Shared Supply/Logistics signal: carrier delivered, receipt still pending."""
     return (
         db.query(Shipment)
         .join(
@@ -24,17 +27,73 @@ def delivery_mismatch_exists(db) -> bool:
     )
 
 
+def shipment_delay_exists(db) -> bool:
+    """Shared Supply/Logistics signal: a shipment is marked delayed and hasn't arrived."""
+    return (
+        db.query(Shipment)
+        .filter(Shipment.logistics_status == "DELAYED")
+        .first()
+        is not None
+    )
+
+
+def count_available_kits(db, *, study_id: str, site_id: str, product_label: str | None) -> int:
+    """Backup kit stock for a product at a site — shared by every Supply/Logistics issue type."""
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(Kit)
+            .where(Kit.study_id == study_id)
+            .where(Kit.site_id == site_id)
+            .where(Kit.product_label == product_label)
+            .where(Kit.kit_status.in_(["AVAILABLE", "RECEIVED"]))
+            .where(Kit.dispensed_at.is_(None))
+        )
+        or 0
+    )
+
+
+def count_upcoming_drug_visits(db, *, study_id: str, site_id: str, window_days: int) -> int:
+    """Drug-required visits coming up soon at a site — shared by every Supply/Logistics issue type."""
+    now = datetime.utcnow()
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(Visit)
+            .where(Visit.study_id == study_id)
+            .where(Visit.site_id == site_id)
+            .where(Visit.drug_required.is_(True))
+            .where(Visit.visit_at >= now)
+            .where(Visit.visit_at <= now + timedelta(days=window_days))
+        )
+        or 0
+    )
+
+
 def supply_logistics_node(state: AgentWorkflowState) -> dict[str, Any]:
     """
     Isolate a specific issue within Supply/Logistics.
 
     Current supported classifications:
     - Delivery Not Registered
+    - Shipment Delays
 
-    Shipment Delays and Safety Stock Depletion can be added here without
-    changing the Main Node or the delivery issue subgraph.
+    Safety Stock Depletion can be added here without changing the Main Node
+    or either issue subgraph.
+
+    When a scan already found a specific candidate, trust the issue type it
+    was tagged with rather than re-deriving it — the candidate is the one
+    shipment this run is actually about. The global existence checks below
+    only apply to the no-candidate fallback scan.
     """
-    issue_type = "Delivery Not Registered" if delivery_mismatch_exists(state["db"]) else None
+    candidate = state.get("candidate") or {}
+    issue_type = candidate.get("issue_type")
+    if issue_type is None:
+        if delivery_mismatch_exists(state["db"]):
+            issue_type = "Delivery Not Registered"
+        elif shipment_delay_exists(state["db"]):
+            issue_type = "Shipment Delays"
+
     return {
         "risk_type": "Supply/Logistics",
         "issue_type": issue_type,
@@ -44,7 +103,7 @@ def supply_logistics_node(state: AgentWorkflowState) -> dict[str, Any]:
             event(
                 "Supply/Logistics Node",
                 (
-                    "Classified the anomaly as Delivery Not Registered."
+                    f"Classified the anomaly as {issue_type}."
                     if issue_type
                     else "No supported Supply/Logistics issue was isolated."
                 ),
@@ -82,5 +141,6 @@ def _unsupported_risk_node(
 def route_from_risk_node(state: AgentWorkflowState) -> str:
     routes = {
         "Delivery Not Registered": "delivery_initial_node",
+        "Shipment Delays": "shipment_delay_initial_node",
     }
     return routes.get(state["issue_type"], "finish_without_issue")

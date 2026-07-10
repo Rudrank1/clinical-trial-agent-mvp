@@ -1,94 +1,9 @@
 from datetime import datetime, timedelta
 
-import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-
 from app.models.agent_system import Issue, IssueAction
-from app.models.base import Base
 from app.models.source_systems import Country, Kit, Shipment, Site, Study
-from app.services.gmail_toolkit_service import ReceivedReply, SentEmail
-from app.services.gemini_service import GeminiEmailDraft, GeminiReplyDecision
-from app.workflows import delivery_not_registered as delivery_workflow
+from app.services.gmail_toolkit_service import ReceivedReply
 from app.workflows import orchestrator
-
-
-@pytest.fixture()
-def db():
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
-    try:
-        yield session
-    finally:
-        session.close()
-        Base.metadata.drop_all(engine)
-
-
-@pytest.fixture()
-def mock_email(monkeypatch):
-    sent_messages = []
-
-    def fake_generate_email(*, issue_id, candidate, follow_up_count, receipt_instructions):
-        return GeminiEmailDraft(
-            subject=f"IRT receipt required for shipment {candidate['shipment_id']}",
-            body=(
-                "A Gemini-generated receipt reminder.\n\n"
-                f"Issue ID: {issue_id}\n"
-                f"Shipment ID: {candidate['shipment_id']}\n"
-                f"Study ID: {candidate['study_id']}\n"
-                f"Site ID: {candidate['site_id']}\n"
-                f"Pending kit count: {candidate['pending_kit_count']}\n"
-                f"Instructions: {receipt_instructions}"
-            ),
-            model_used="mock-gemini",
-            prompt_name="mock.follow_up",
-        )
-
-    def fake_classify_reply(response_text, *, issue_id=None, candidate=None):
-        text = response_text.lower()
-        if "no knowledge" in text or "cannot find" in text:
-            outcome = "no_knowledge"
-        elif "fixed" in text or "registered" in text or "resolved" in text:
-            outcome = "fixed"
-        else:
-            outcome = "unclear"
-        return GeminiReplyDecision(
-            outcome=outcome,
-            confidence=0.99,
-            rationale="mock classifier",
-            model_used="mock-gemini",
-            prompt_name="mock.decision",
-        )
-
-    def fake_send_email(*, issue_id, subject, body, reply_to_message_id=None):
-        sent = SentEmail(
-            message_id=f"<message-{len(sent_messages) + 1}@test>",
-            sender="rudrank2004@gmail.com",
-            recipient="rudymer313@gmail.com",
-            subject=subject,
-            gmail_thread_id=f"thread-{issue_id}",
-            raw_tool_result="mock GmailToolkit send result",
-        )
-        sent_messages.append(
-            {
-                "sent": sent,
-                "body": body,
-                "reply_to_message_id": reply_to_message_id,
-            }
-        )
-        return sent
-
-    monkeypatch.setattr(delivery_workflow, "generate_delivery_followup_email", fake_generate_email)
-    monkeypatch.setattr(delivery_workflow, "classify_delivery_reply", fake_classify_reply)
-    monkeypatch.setattr(delivery_workflow, "send_email", fake_send_email)
-    monkeypatch.setattr(orchestrator, "send_email", fake_send_email)
-    return sent_messages
 
 
 def seed_unregistered_delivery(db):
@@ -441,3 +356,41 @@ def test_update_shipment_status_correction_closes_issue(db, mock_email):
     assert db.get(Issue, issue_id).status == "Closed"
     shipment = db.get(Shipment, ("STUDY-1", "SHIP-1"))
     assert shipment.logistics_status == "IN_TRANSIT"
+
+
+def test_mixed_scan_creates_correctly_typed_issues_for_each_candidate(db, mock_email):
+    """Regression test for supply_logistics_node trusting each candidate's own
+    issue_type instead of re-deriving it from a global existence check — with
+    two issue types live, a stale global check would misclassify one of these.
+    """
+    seed_unregistered_delivery(db)
+    db.add(Study(study_id="STUDY-2", study_status="ACTIVE"))
+    db.add(Country(study_id="STUDY-2", country_id="US", country_name="United States"))
+    db.add(Site(study_id="STUDY-2", site_id="SITE-2", country_id="US", site_status="ACTIVE"))
+    db.add(
+        Shipment(
+            study_id="STUDY-2",
+            shipment_id="SHIP-2",
+            site_id="SITE-2",
+            logistics_status="DELAYED",
+            requested_at=datetime.utcnow() - timedelta(days=10),
+            shipped_at=datetime.utcnow() - timedelta(days=8),
+            carrier_name="Mock Carrier 2",
+            tracking_number="TRACK-2",
+            product_label="DRUG-B",
+        )
+    )
+    db.commit()
+
+    results = orchestrator.run_full_agentic_workflow(db)
+
+    assert len(results) == 2
+    issues = db.query(Issue).order_by(Issue.issue_id).all()
+    assert {issue.issue_type for issue in issues} == {"Delivery Not Registered", "Shipment Delays"}
+
+    delivery_issue = next(i for i in issues if i.issue_type == "Delivery Not Registered")
+    delay_issue = next(i for i in issues if i.issue_type == "Shipment Delays")
+    assert delivery_issue.reference_key == "delivery_not_registered:STUDY-1:SHIP-1"
+    assert delay_issue.reference_key == "shipment_delays:STUDY-2:SHIP-2"
+    assert delivery_issue.status == "Open"
+    assert delay_issue.status == "Open"

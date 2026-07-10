@@ -12,6 +12,7 @@ from app.db.database import SessionLocal
 from app.models.agent_system import Issue, IssueAction
 from app.models.source_systems import Country, Kit, Shipment, Site, Study, Subject
 from app.workflows.delivery_not_registered import get_mismatch_snapshot
+from app.workflows.shipment_delays import get_delay_context_snapshot
 from app.workflows.orchestrator import (
     continue_issue,
     process_due_issue_checks,
@@ -420,6 +421,7 @@ def get_issue(issue_id: int, db: Session = Depends(get_db)):
         "updated_at": issue.updated_at,
         "resolved_at": issue.resolved_at,
         "mismatch": get_mismatch_snapshot(db, issue),
+        "delay_context": get_delay_context_snapshot(db, issue),
         "evidence": [
             {
                 "id": evidence.evidence_id,

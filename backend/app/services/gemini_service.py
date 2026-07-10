@@ -123,6 +123,73 @@ Issue data JSON:
     )
 
 
+def generate_shipment_delay_email(
+    *,
+    issue_id: int,
+    candidate: dict[str, Any],
+    follow_up_count: int,
+) -> GeminiEmailDraft:
+    """Use Gemini to write the issue-specific shipment delay follow-up email."""
+    llm = _llm(temperature=0.45)
+    prompt_name = "shipment_delays.follow_up_email.v1_natural"
+    payload = _delay_candidate_payload(candidate)
+    prompt = f"""
+You are a clinical trial supply coordinator writing a real email about a delayed shipment.
+
+Write a natural, human-sounding email asking for an update on a shipment that hasn't arrived yet.
+The email should feel like it came from an operations teammate, not from an automated ticketing system.
+
+Context:
+- The carrier's tracking data shows this shipment as delayed and it has not yet arrived.
+- The reason for the delay, a revised arrival estimate, and whether it can be expedited or replaced aren't things that can be figured out from tracking data alone — a person needs to weigh in.
+
+Style requirements:
+- Use a practical subject line that would make sense to the recipient without internal database context.
+- Do NOT mention CTA-ISSUE, issue ID, database ID, workflow node, agent, automation, Gemini, AI, JSON, or prompt in the subject or body.
+- Do NOT name or assume any specific software system (no IRT, IBP, CTMS, SAP, or similar internal system names) — the recipient's organization may not use the same tools. Refer to actions and records in plain, generic terms instead.
+- Do NOT include a tracking token in the subject or body.
+- Do NOT sound like a generated autoresponse.
+- Keep the tone polite, calm, plain, and direct — avoid technical or clinical-operations jargon.
+- Start with a normal greeting.
+- Include a short reason for the note.
+- Ask for: the reason for the delay, a revised estimated arrival, whether the shipment can be expedited, and whether a replacement shipment should be sent instead.
+- It's fine to ask the recipient to reply with this information, since it can't be detected automatically — but also mention that if the shipment's tracking status changes on its own (for example it starts moving again or arrives), that will be noticed automatically too.
+- Close with a normal sign-off from the Clinical Supply Monitoring Team.
+- Do not invent facts that are not in the supplied JSON.
+- Use short paragraphs with blank lines between them.
+- Do NOT use markdown syntax of any kind — no asterisks, no bullet points, no bold or italic markers, no headers, no numbered lists. Write in plain flowing sentences only.
+- When mentioning several details, weave them into a sentence or short paragraph instead of listing them.
+- Do NOT return one dense paragraph.
+- PLEASE use line breaks and whitespace after greeting and before sign off.
+- This is follow-up attempt {follow_up_count}; if this is not the first attempt, politely acknowledge that this is a follow-up, but do not make it sound accusatory.
+- Return only the structured email object.
+
+Required details to include when available:
+- Shipment ID
+- Study ID
+- Site ID
+- Carrier and tracking number
+- Product label
+- How long the shipment has been in transit
+
+Issue data JSON:
+{json.dumps(payload, indent=2, default=str)}
+""".strip()
+
+    structured = llm.with_structured_output(DeliveryFollowUpEmail)
+    result = structured.invoke(prompt)
+    return GeminiEmailDraft(
+        subject=_natural_subject(
+            str(result.subject),
+            candidate,
+            fallback=f"Update needed on shipment {candidate.get('shipment_id') or 'delay'}",
+        ),
+        body=_natural_body(str(result.body)),
+        model_used=GEMINI_MODEL,
+        prompt_name=prompt_name,
+    )
+
+
 def interpret_delivery_reply(
     *,
     issue_id: int,
@@ -195,6 +262,26 @@ def _candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
     return {key: candidate.get(key) for key in keys}
 
 
+def _delay_candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "reference_key",
+        "shipment_id",
+        "study_id",
+        "site_id",
+        "country",
+        "depot",
+        "carrier_status",
+        "carrier_name",
+        "tracking_number",
+        "product_label",
+        "days_in_transit",
+        "available_kit_count",
+        "upcoming_drug_visit_count",
+        "severity",
+    ]
+    return {key: candidate.get(key) for key in keys}
+
+
 def _strip_markdown(text: str) -> str:
     """Remove markdown syntax that leaked through despite the prompt instructions."""
     clean = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
@@ -204,7 +291,7 @@ def _strip_markdown(text: str) -> str:
     return clean
 
 
-def _natural_subject(subject: str, candidate: dict[str, Any]) -> str:
+def _natural_subject(subject: str, candidate: dict[str, Any], *, fallback: str | None = None) -> str:
     """Remove internal workflow language from Gemini output and keep the subject useful."""
     clean = str(subject or "").strip()
     clean = re.sub(r"\[?CTA[-_ ]?ISSUE[-_ ]?\d*\]?", "", clean, flags=re.IGNORECASE)
@@ -214,7 +301,7 @@ def _natural_subject(subject: str, candidate: dict[str, Any]) -> str:
     clean = re.sub(r"\s+", " ", clean).strip(" -:|")
     if not clean:
         shipment_id = candidate.get("shipment_id") or "the recent shipment"
-        clean = f"Receipt confirmation needed for shipment {shipment_id}"
+        clean = fallback or f"Receipt confirmation needed for shipment {shipment_id}"
     return clean[:180]
 
 
